@@ -8,9 +8,9 @@
 | 项目 | 路径/值 |
 | --- | --- |
 | 仓库源文件 | `backend/ops-platform-api/ops_platform_api.py` |
-| 233 部署文件 | `/home/yvesyuan/PycharmProjects/anbo_wx/backend/app/routes/netops2026.py` |
+| 233 部署文件 | `/srv/netops/netops-littleProgram/backend/app/routes/netops2026.py` |
 | 公共 API 前缀 | `/api/netops2026` |
-| Nginx 对外前缀 | `/wx/api/netops2026` |
+| Nginx 对外前缀 | `/api/netops2026` |
 
 当前模块复用 `anbo_wx` 已有的登录、JWT、用户、组织和审计能力，所以仍以路由文件形式嵌入。未来如果平台后端独立部署，应再拆分为标准 Flask 包：应用工厂、配置、路由、服务层和数据访问层。
 

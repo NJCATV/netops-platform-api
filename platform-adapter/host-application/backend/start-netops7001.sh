@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-BACKEND=/home/yvesyuan/PycharmProjects/anbo_wx/backend
+BACKEND=/srv/netops/netops-littleProgram/backend
 PIDFILE=$BACKEND/logs/netops7001.pid
 if test -f "$PIDFILE"; then
   PID=$(cat "$PIDFILE" 2>/dev/null || true)

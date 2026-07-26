@@ -23,4 +23,4 @@
 python -m py_compile ops_platform_api.py
 ```
 
-发布后须验证统一登录、权限拒绝、`/wx/api/netops2026/*`、采集代理、Radius 查询和 AIOps 签名调用。
+发布后须验证统一登录、权限拒绝、`/api/netops2026/*`、采集代理、Radius 查询和 AIOps 签名调用。

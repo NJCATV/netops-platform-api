@@ -54,10 +54,10 @@ PROFILES = {
 LOG_SOURCES = {
     "platform": {
         "bff": {"kind": "file", "paths": [
-            "/home/yvesyuan/PycharmProjects/anbo_wx/backend/logs/netops7001.log",
-            "/home/yvesyuan/PycharmProjects/anbo_wx/backend/logs/api-7001.log",
+            "/srv/netops/netops-littleProgram/backend/logs/netops7001.log",
+            "/srv/netops/netops-littleProgram/backend/logs/api-7001.log",
         ], "label": "网管 BFF"},
-        "web": {"kind": "file", "paths": ["/home/yvesyuan/PycharmProjects/anbo_wx/backend/logs/run.log"], "label": "平台 Web"},
+        "web": {"kind": "file", "paths": ["/srv/netops/netops-littleProgram/backend/logs/run.log"], "label": "平台 Web"},
     },
     "collector": {
         "collector": {"kind": "file", "paths": ["/home/jscn123/PycharmProjects/newalert/logs/onu_self_collect/onu_self_collect.log"], "label": "ONU 采集"},

@@ -1,6 +1,6 @@
 # 233 runtime source baseline
 
-Captured on 2026-07-26 from the active `zhiwei-api` deployment on server 233.
+Captured on 2026-07-26 from the active `netops-platform-api` deployment on server 233.
 
 - Canonical deployed NetOps route: `platform-adapter/anbo_wx/backend/app/routes/netops2026.py`.
 - The route is loaded by the existing `anbo_wx` Flask application; it is not a standalone service.
