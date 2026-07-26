@@ -4684,6 +4684,41 @@ def radius_hours():
     return int_arg("hours", 24, 1, 24 * 180)
 
 
+def radius_traffic_anomalies(hours):
+    """Return every account matching an explicit window-scaled traffic rule."""
+    gib = 1024 ** 3
+    heavy_threshold = max(10 * gib, int(50 * gib * hours / 24))
+    upload_threshold = max(5 * gib, int(20 * gib * hours / 24))
+    upload_ratio_threshold = 4
+    rows = radius_ch_query(
+        f"""
+        SELECT username,
+               sum(input_delta) AS input_bytes,
+               sum(output_delta) AS output_bytes,
+               sum(input_delta + output_delta) AS total_bytes,
+               round(input_bytes / greatest(output_bytes, 1), 2) AS upload_ratio,
+               uniqExact(acct_session_id) AS sessions,
+               toString(max(event_time)) AS last_seen,
+               toUInt8(total_bytes >= {heavy_threshold}) AS heavy_volume,
+               toUInt8(input_bytes >= {upload_threshold}
+                       AND upload_ratio >= {upload_ratio_threshold}) AS high_upload
+        FROM radius_events
+        WHERE event_type='accounting' AND username!=''
+          AND event_time >= now() - INTERVAL {hours} HOUR
+        GROUP BY username
+        HAVING heavy_volume=1 OR high_upload=1
+        ORDER BY high_upload DESC,total_bytes DESC
+        FORMAT JSON
+        """
+    )
+    return rows, {
+        "window_hours": hours,
+        "heavy_volume_bytes": heavy_threshold,
+        "upload_bytes": upload_threshold,
+        "upload_ratio": upload_ratio_threshold,
+    }
+
+
 def radius_time_window():
     """Return a safe ClickHouse time predicate and the selected window metadata.
 
@@ -4967,11 +5002,12 @@ def radius_profile():
                        "title": "近期认证失败率偏高",
                        "detail": f"近 180 天 {reject_total}/{auth_total} 次认证被拒绝，最近原因：{summary.get('latest_auth_reason') or '未知'}"})
         score -= 30
-    if int(summary.get("mac_count") or 0) >= 3:
+    if int(summary.get("mac_count") or 0) >= 2:
+        mac_count = int(summary.get("mac_count") or 0)
         issues.append({"level": "medium", "code": "multi_mac",
-                       "title": "账号关联多个终端",
-                       "detail": f"已关联 {summary.get('mac_count')} 个 MAC，建议确认换机或账号共享。"})
-        score -= 15
+                       "title": "账号存在多终端拨号风险",
+                       "detail": f"近 180 天已关联 {mac_count} 个可信 MAC；可信关系仅来自成功认证或 Accounting，请核实换机、路由器更换或账号共享。"})
+        score -= 20 if mac_count == 2 else 30
     if int(summary.get("starts_1h") or 0) >= 3:
         issues.append({"level": "medium", "code": "frequent_reconnect",
                        "title": "一小时内频繁重连",
@@ -5126,17 +5162,7 @@ def radius_analytics():
             GROUP BY username HAVING start_count >= 3
             ORDER BY start_count DESC,last_seen DESC LIMIT 100 FORMAT JSON"""
     )
-    traffic_patterns = radius_ch_query(
-        f"""SELECT username,sum(input_delta) AS input_bytes,sum(output_delta) AS output_bytes,
-                   sum(input_delta+output_delta) AS total_bytes,
-                   round(input_bytes/greatest(output_bytes,1),2) AS upload_ratio,
-                   uniqExact(acct_session_id) AS sessions,toString(max(event_time)) AS last_seen
-            FROM radius_events
-            WHERE event_type='accounting' AND username!=''
-              AND event_time >= now() - INTERVAL {hours} HOUR
-            GROUP BY username HAVING total_bytes > 0
-            ORDER BY total_bytes DESC LIMIT 100 FORMAT JSON"""
-    )
+    traffic_patterns, traffic_rules = radius_traffic_anomalies(hours)
     online_sessions = radius_ch_query(
         f"""SELECT username,acct_session_id,nas_ip,mac_addr,framed_ip,
                    toString(last_seen) AS last_seen,session_seconds,input_bytes,output_bytes
@@ -5220,7 +5246,8 @@ def radius_analytics():
     )
     return success({
         "reasons": reasons, "nas": nas, "reconnects": reconnects,
-        "traffic_patterns": traffic_patterns, "online_sessions": online_sessions,
+        "traffic_patterns": traffic_patterns, "traffic_rules": traffic_rules,
+        "online_sessions": online_sessions,
         "terminate_causes": terminate_causes, "nas_restarts": nas_restarts,
         "control_events": control_events, "protocol_quality": protocol_quality,
         "terminal_sharing": terminal_sharing, "ip_conflicts": ip_conflicts, "hours": hours,
@@ -5259,7 +5286,9 @@ def radius_multi_mac_risk():
         return denied
     hours = radius_hours()
     min_macs = int_arg("min_macs", 2, 2, 1000)
-    limit = int_arg("limit", 100, 1, 500)
+    limit_clause = ""
+    if request.args.get("limit") is not None:
+        limit_clause = f" LIMIT {int_arg('limit', 100, 1, 500)}"
     rows = radius_ch_query(
         f"""
         SELECT username,uniqExact(mac_addr) AS mac_count,
@@ -5272,7 +5301,7 @@ def radius_multi_mac_risk():
           AND event_time >= now() - INTERVAL {hours} HOUR
           AND ((event_type='auth' AND result_code=2) OR event_type='accounting')
         GROUP BY username HAVING mac_count >= {min_macs}
-        ORDER BY mac_count DESC,auth_count DESC LIMIT {limit}
+        ORDER BY mac_count DESC,auth_count DESC{limit_clause}
         FORMAT JSON
         """
     )
@@ -5313,9 +5342,11 @@ def radius_accounting():
                    dateDiff('second',min(event_time),max(event_time)) AS observed_seconds
             FROM radius_events WHERE {where} FORMAT JSON"""
     ) or [{}])[0]
+    anomalies, anomaly_rules = radius_traffic_anomalies(hours)
     return success({"summary": summary, "traffic": traffic,
                     "quality": quality,
-                    "coverage": coverage, "hours": hours})
+                    "coverage": coverage, "anomalies": anomalies,
+                    "anomaly_rules": anomaly_rules, "hours": hours})
 
 
 @netops2026_bp.get("/radius/ingest/status")
