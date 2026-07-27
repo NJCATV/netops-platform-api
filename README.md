@@ -7,12 +7,15 @@
 
 | 项目 | 路径/值 |
 | --- | --- |
-| 仓库源文件 | `backend/ops-platform-api/ops_platform_api.py` |
+| 规范路由源 | `ops_platform_api.py` |
+| 宿主适配副本 | `platform-adapter/host-application/backend/app/routes/netops2026.py` |
 | 233 部署文件 | `/srv/netops/netops-littleProgram/backend/app/routes/netops2026.py` |
 | 公共 API 前缀 | `/api/netops2026` |
 | Nginx 对外前缀 | `/api/netops2026` |
 
 当前模块以路由适配层方式嵌入 `netops-littleProgram` 宿主应用，复用统一登录、JWT、用户、组织和审计能力。历史 MySQL schema 仍可能名为 `anbo_wx`，但该名称不再用于部署路径、服务名或公开 API。未来如果平台后端独立部署，应再拆分为标准 Flask 包：应用工厂、配置、路由、服务层和数据访问层。
+
+每次修改路由时必须同时更新“规范路由源”和“宿主适配副本”，并在发布窗口内将适配副本同步到 233；不得直接用 Git 覆盖用户正在编辑的宿主工作区。
 
 ## 本地检查
 
