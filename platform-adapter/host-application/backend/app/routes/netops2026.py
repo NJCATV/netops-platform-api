@@ -952,7 +952,7 @@ def infrastructure_node_status(resources, services):
 def clickhouse_infrastructure_node():
     node = {
         "id": "212", "name": "ClickHouse 分析节点", "host": str(_secret_config().get("clickhouse", {}).get("host") or "172.25.194.212"),
-        "role": "ONU、Radius 分析数据仓库", "management": [{"label": "ClickHouse Play", "url": "http://172.25.194.212:8123/play"}],
+        "role": "ONU、Radius 分析数据仓库", "management": [],
     }
     started_at = time.monotonic()
     services = []
@@ -1038,17 +1038,17 @@ def infrastructure_snapshot(force=False):
         values = [node_status.get(str(node_id), "failed") for node_id in node_ids]
         return "failed" if "failed" in values else "warning" if "warning" in values else "ok"
     # Links come from the live production configuration and actual BFF calls.
-    # Firewall captions are the last verified host-policy baseline.  They are
-    # deliberately explicit about the two hosts that still need an audit, so
-    # a reachable service is never mistaken for an access-controlled service.
+    # Firewall captions are the last verified host-policy baseline.  They make
+    # source allowlists visible so a reachable service is never mistaken for a
+    # public service.
     topology = [
         {"id": "web-entry", "from": "clients", "to": "233", "protocol": "HTTPS", "ports": "5772", "direction": "用户 → 平台", "description": "浏览器经 233:5772 访问统一网管入口（Nginx → Vue / BFF）", "status": node_status.get("233", "failed"), "firewall": "233 UFW：5772 对外；BFF 7001 仅回环；SSH 由 Fail2ban 防护"},
         {"id": "collector-api", "from": "233", "to": "236", "protocol": "HTTP", "ports": "18086", "direction": "233 → 236", "description": "采集探测、设备查询与采集状态", "status": link_status("233", "236"), "firewall": "236 当前未启用主机入站白名单；仅 SSH Fail2ban，需收紧 18086 来源"},
         {"id": "collector-mysql", "from": "233", "to": "236", "protocol": "MySQL", "ports": "3339", "direction": "233 → 236", "description": "OLT、CMTS、ONU 与采集结果查询", "status": link_status("233", "236"), "firewall": "236 当前未启用主机入站白名单；需按 172.31 网段与管理来源收紧 3339"},
         {"id": "aiops-api", "from": "233", "to": "20", "protocol": "HTTP + 签名", "ports": "18080", "direction": "233 → 20", "description": "AIOps 分析、事件、日志与知识库代理", "status": link_status("233", "20"), "firewall": "20 端口守卫：18080 仅 233 与回环；SSH Fail2ban 已启用"},
-        {"id": "clickhouse", "from": "233", "to": "212", "protocol": "ClickHouse HTTP", "ports": "8123", "direction": "233 → 212", "description": "ONU 质差、性能与 Radius 分析查询", "status": link_status("233", "212"), "firewall": "212 数据节点访问策略待主机级审计；链路由实时查询验证"},
+        {"id": "clickhouse", "from": "233", "to": "212", "protocol": "ClickHouse HTTP", "ports": "8123", "direction": "233 → 212", "description": "ONU 质差、性能与 Radius 分析查询", "status": link_status("233", "212"), "firewall": "212 端口守卫：8123 仅 233、236、213 与回环；SSH 5334 仅 172.31.0.0/16；Fail2ban 已启用"},
         {"id": "radius-udp", "from": "radius_nas", "to": "213", "protocol": "RADIUS / UDP", "ports": "1812 / 1813 / 3799", "direction": "NAS / BRAS → 213", "description": "认证、Accounting 与 CoA/Disconnect 报文镜像抓包", "status": node_status.get("213", "failed"), "firewall": "213 端口守卫已限制 3306/18190；SSH Fail2ban 已启用；UDP 来源需按 NAS/BRAS 清单复核"},
-        {"id": "radius-sink", "from": "213", "to": "212", "protocol": "ClickHouse HTTP", "ports": "8123", "direction": "213 → 212", "description": "解析结果与采集指标写入 Radius 分析库", "status": link_status("213", "212"), "firewall": "212 数据节点访问策略待主机级审计；落库链路由实时探测验证"},
+        {"id": "radius-sink", "from": "213", "to": "212", "protocol": "ClickHouse HTTP", "ports": "8123", "direction": "213 → 212", "description": "解析结果与采集指标写入 Radius 分析库", "status": link_status("213", "212"), "firewall": "212 端口守卫：8123 仅 233、236、213 与回环；9000/9004/9005/9009 仅本机；Fail2ban 已启用"},
     ]
     result = {"observed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "nodes": nodes, "components": components, "topology": topology, "summary": {"total_nodes": len(nodes), "healthy_nodes": sum(1 for node in nodes if node.get("status") == "ok"), "warning_nodes": warning, "failed_nodes": sum(1 for node in nodes if node.get("status") == "failed"), "total_components": len(components), "failed_components": failed}}
     _INFRASTRUCTURE_CACHE.update({"expires_at": now + 20, "payload": result})
