@@ -926,7 +926,7 @@ def infrastructure_http_logs(node, token, service, limit):
     """Fetch only a curated service key from the node log endpoint."""
     headers = {"Authorization": "Bearer " + token} if token else {}
     base = str(node["url"]).rsplit("/", 1)[0]
-    query = urlparse.urlencode({"service": service, "limit": limit})
+    query = parse.urlencode({"service": service, "limit": limit})
     req = urlrequest.Request(f"{base}/logs?{query}", headers=headers)
     try:
         with urlrequest.urlopen(req, timeout=8) as response:
