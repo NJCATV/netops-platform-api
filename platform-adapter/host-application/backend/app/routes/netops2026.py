@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import socket
+import threading
 import time
 import zipfile
 import xml.etree.ElementTree as ET
@@ -658,8 +659,19 @@ def ch_query(sql):
         return json.loads(resp.read().decode("utf-8")).get("data", [])
 
 
-def radius_ch_query(sql):
-    """Query the dedicated Radius ClickHouse database with a read-only account."""
+def radius_ch_query(sql, cache_seconds=45):
+    """Query the dedicated Radius ClickHouse database with a read-only account.
+
+    Radius landing pages fan out into several aggregate queries.  A short
+    read-through cache coalesces repeated views and the cockpit's periodic
+    refreshes without hiding a meaningful operational change.
+    """
+    cache_id = None
+    if cache_seconds:
+        cache_id = cache_key("radius_ch_query", {"sql": " ".join(sql.split())})
+        cached = cache_get_json(cache_id, touch_ttl=cache_seconds)
+        if cached is not None:
+            return cached
     cfg = _secret_config().get("radius_clickhouse", {})
     host = cfg.get("host", os.getenv("RADIUS_CLICKHOUSE_HOST", "172.25.194.212"))
     port = int(cfg.get("http_port", cfg.get("port", os.getenv("RADIUS_CLICKHOUSE_PORT", "8123"))))
@@ -677,7 +689,10 @@ def radius_ch_query(sql):
         req.add_header("X-ClickHouse-Key", password)
     try:
         with urlrequest.urlopen(req, timeout=25) as resp:
-            return json.loads(resp.read().decode("utf-8")).get("data", [])
+            result = json.loads(resp.read().decode("utf-8")).get("data", [])
+        if cache_id:
+            cache_set_json(cache_id, result, cache_seconds)
+        return result
     except urlerror.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:500]
         raise RuntimeError(f"Radius ClickHouse HTTP {exc.code}: {detail}") from exc
@@ -761,10 +776,15 @@ def cache_key(name, params):
     return f"netops2026:{name}:{digest}"
 
 
-def cache_get_json(key):
+def cache_get_json(key, touch_ttl=None):
     raw = redis_command("GET", key)
     if not raw:
         return None
+    if touch_ttl:
+        # Keep frequently viewed operational summaries hot.  This is deliberately
+        # a small sliding window; refreshes do not extend data beyond the current
+        # operator activity period.
+        redis_command("EXPIRE", key, int(touch_ttl))
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -773,6 +793,44 @@ def cache_get_json(key):
 
 def cache_set_json(key, value, ttl):
     redis_command("SETEX", key, int(ttl), json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+_DASHBOARD_REFRESH_LOCK = threading.Lock()
+_DASHBOARD_REFRESHING = set()
+
+
+def schedule_dashboard_refresh(cache_key_value, hours, user_id):
+    """Refresh one permission-scoped cockpit snapshot off the request path."""
+    with _DASHBOARD_REFRESH_LOCK:
+        if cache_key_value in _DASHBOARD_REFRESHING:
+            return
+        _DASHBOARD_REFRESHING.add(cache_key_value)
+    # Gunicorn has multiple workers.  Use Redis as a short distributed lease so
+    # concurrent page opens still result in a single expensive aggregation.
+    refresh_lease_key = "netops2026:dashboard_refresh:" + hashlib.sha1(cache_key_value.encode("utf-8")).hexdigest()
+    if redis_command("SET", refresh_lease_key, "1", "NX", "EX", 90) != "OK":
+        with _DASHBOARD_REFRESH_LOCK:
+            _DASHBOARD_REFRESHING.discard(cache_key_value)
+        return
+    app = current_app._get_current_object()
+
+    def refresh():
+        try:
+            with app.app_context():
+                user = db.session.get(User, int(user_id))
+                if user is None or user.status != "active":
+                    return
+                with app.test_request_context(f"/api/netops2026/dashboard?hours={int(hours)}&refresh=1"):
+                    g.current_user = user
+                    # Invoke the protected view body with the same user scope.
+                    dashboard.__wrapped__()
+        except Exception:
+            app.logger.exception("background cockpit refresh failed")
+        finally:
+            with _DASHBOARD_REFRESH_LOCK:
+                _DASHBOARD_REFRESHING.discard(cache_key_value)
+
+    threading.Thread(target=refresh, name=f"netops-dashboard-{hours}h", daemon=True).start()
 
 
 _dashboard_activity_schema_ready = False
@@ -854,13 +912,9 @@ def dashboard_presence():
         """,
         (int(g.current_user.id), visit_delta, visit_delta, visit_delta),
     )
-    # The dashboard has a very short aggregate cache. Clear only this caller's
-    # scoped variants so the new heartbeat is visible on the first page render.
-    regions = allowed_device_regions()
-    user_scope = visible_user_org_ids()
-    for hours in (24, 168, 720):
-        for is_super_admin in (False, True):
-            redis_command("DEL", cache_key("operations_dashboard", {"hours": hours, "regions": regions, "user_scope": user_scope, "is_super_admin": is_super_admin}))
+    # Do not evict the expensive dashboard aggregate for a heartbeat.  The
+    # cockpit is served from a pre-warmed snapshot; evicting it here turned
+    # every page entry into a cold MySQL/ClickHouse calculation.
     return success({"visit_recorded": visit, "online_window_minutes": 5})
 
 
@@ -2257,9 +2311,23 @@ def dashboard():
     # previously cached global account count or visit total.
     user_scope = visible_user_org_ids()
     cache_params = {"hours": hours, "regions": regions, "user_scope": user_scope, "is_super_admin": getattr(g.current_user, "role_code", "") == "super_admin"}
-    cached = cache_get_json(cache_key("operations_dashboard", cache_params))
-    if cached is not None:
-        return success(cached)
+    force_refresh = request.args.get("refresh") == "1"
+    dashboard_cache_key = cache_key("operations_dashboard", cache_params)
+    cached = cache_get_json(dashboard_cache_key)
+    if cached is not None and not force_refresh:
+        # Serve the most recent snapshot immediately.  Once it is one minute
+        # old, one daemon thread recomputes it for the next view; concurrent
+        # visitors keep receiving the usable snapshot instead of queueing on
+        # identical MySQL/ClickHouse aggregates.
+        if isinstance(cached, dict) and isinstance(cached.get("payload"), dict):
+            payload = cached["payload"]
+            age_seconds = max(0, time.time() - float(cached.get("generated_at") or 0))
+        else:
+            # Compatibility with cache entries written before SWR was added.
+            payload, age_seconds = cached, float("inf")
+        if age_seconds >= 60:
+            schedule_dashboard_refresh(dashboard_cache_key, hours, int(g.current_user.id))
+        return success(payload)
     region_where = ""
     region_args = []
     if regions is not None:
@@ -2566,7 +2634,10 @@ def dashboard():
             "summary": infrastructure.get("summary", {}),
             "components": infrastructure.get("components", [])[:12],
         }
-    cache_set_json(cache_key("operations_dashboard", cache_params), payload, 30)
+    # Preserve the last successful cockpit model for instant page entry across
+    # quiet periods and restarts.  The one-minute generated_at threshold still
+    # controls background freshness.
+    cache_set_json(dashboard_cache_key, {"generated_at": time.time(), "payload": payload}, 604800)
     return success(payload)
 
 
@@ -3731,7 +3802,8 @@ def query_boss_map(macs):
         chunk = macs[i:i + 800]
         rows = query_all(
             f"""
-            SELECT onu_mac_norm, id_number AS gdf_account, name AS customer_name
+            SELECT onu_mac_norm, id_number AS gdf_account, name AS customer_name,
+                   company, phone1, phone2, grid
             FROM boss_user_info
             WHERE onu_mac_norm IN ({mysql_placeholders(chunk)})
             """,
@@ -3894,6 +3966,10 @@ def enrich_quality_items(rows, include_boss=True, include_business=True, include
             boss = boss_map.get(normalize_mac(item.get("onu_mac")), {})
             item["gdf_account"] = boss.get("gdf_account") or ""
             item["customer_name"] = boss.get("customer_name") or ""
+            item["company"] = boss.get("company") or ""
+            item["phone1"] = boss.get("phone1") or ""
+            item["phone2"] = boss.get("phone2") or ""
+            item["grid"] = boss.get("grid") or ""
     if include_business:
         biz_map = query_business_map(items)
         for item in items:
@@ -4141,11 +4217,11 @@ def onu_quality_export():
         """
     )
     items = enrich_quality_items(rows, include_boss=True, include_business=True)
-    headers = ["日期", "机房组", "机房", "OLT", "OLT ID", "主IP", "备IP", "PON", "业务类型", "光节点", "ONU MAC", "RX", "TX", "质差原因", "采集时间", "GDF账号", "用户"]
+    headers = ["日期", "机房组", "机房", "网格", "公司", "电话1", "电话2", "OLT", "OLT ID", "主IP", "备IP", "PON", "业务类型", "光节点", "ONU MAC", "RX", "TX", "质差原因", "采集时间", "GDF账号", "用户"]
     export_rows = []
     for row in items:
         export_rows.append([
-            date, row.get("room_group"), row.get("room"), row.get("olt_name"), row.get("olt_device_id"),
+            date, row.get("room_group"), row.get("room"), row.get("grid"), row.get("company"), row.get("phone1"), row.get("phone2"), row.get("olt_name"), row.get("olt_device_id"),
             row.get("primary_ip"), row.get("backup_ip"), row.get("pon_port"), row.get("business_type"),
             row.get("optical_node_code"), fmt_mac(row.get("onu_mac")), row.get("rx_power"), row.get("tx_power"),
             quality_label(row.get("quality_code")), dt_value(row.get("query_time")), row.get("gdf_account"), row.get("customer_name"),
@@ -4685,6 +4761,72 @@ def radius_hours():
     return int_arg("hours", 24, 1, 24 * 180)
 
 
+_RADIUS_SNAPSHOT_LOCK = threading.Lock()
+_RADIUS_SNAPSHOT_REFRESHING = set()
+
+
+def schedule_radius_snapshot_refresh(snapshot_key, endpoint, query_string, view, user_id):
+    """Refresh a shared Radius page snapshot without holding up an operator."""
+    with _RADIUS_SNAPSHOT_LOCK:
+        if snapshot_key in _RADIUS_SNAPSHOT_REFRESHING:
+            return
+        _RADIUS_SNAPSHOT_REFRESHING.add(snapshot_key)
+    lease_key = "netops2026:radius_refresh:" + hashlib.sha1(snapshot_key.encode("utf-8")).hexdigest()
+    if redis_command("SET", lease_key, "1", "NX", "EX", 120) != "OK":
+        with _RADIUS_SNAPSHOT_LOCK:
+            _RADIUS_SNAPSHOT_REFRESHING.discard(snapshot_key)
+        return
+    app = current_app._get_current_object()
+
+    def refresh():
+        try:
+            with app.app_context():
+                user = db.session.get(User, int(user_id))
+                if user is None or user.status != "active":
+                    return
+                with app.test_request_context(f"/api/netops2026/radius/{endpoint}?{query_string}&refresh=1"):
+                    g.current_user = user
+                    view.__wrapped__()
+        except Exception:
+            app.logger.exception("background Radius snapshot refresh failed: %s", endpoint)
+        finally:
+            with _RADIUS_SNAPSHOT_LOCK:
+                _RADIUS_SNAPSHOT_REFRESHING.discard(snapshot_key)
+
+    threading.Thread(target=refresh, name=f"radius-{endpoint}-refresh", daemon=True).start()
+
+
+def radius_page_snapshot(name, params, endpoint, view):
+    """Return a recent page model immediately and refresh it asynchronously.
+
+    This is intentionally page-level rather than one cache entry per SQL query:
+    a Radius page contains several aggregates, and serial cache misses made the
+    initial render unnecessarily slow.
+    """
+    snapshot_key = cache_key("radius_page_snapshot", {"name": name, **params})
+    cached = cache_get_json(snapshot_key)
+    if cached is not None and request.args.get("refresh") != "1":
+        if isinstance(cached, dict) and isinstance(cached.get("payload"), dict):
+            payload = cached["payload"]
+            age_seconds = max(0, time.time() - float(cached.get("generated_at") or 0))
+        else:
+            payload, age_seconds = cached, float("inf")
+        if age_seconds >= 60:
+            query_string = parse.urlencode(params)
+            schedule_radius_snapshot_refresh(
+                snapshot_key, endpoint, query_string, view, int(g.current_user.id)
+            )
+        return payload, snapshot_key
+    return None, snapshot_key
+
+
+def store_radius_page_snapshot(snapshot_key, payload):
+    # Keep the last successful page model across quiet periods so opening a
+    # page never waits for a cold aggregate query.  Data older than one minute
+    # is still refreshed asynchronously by ``radius_page_snapshot``.
+    cache_set_json(snapshot_key, {"generated_at": time.time(), "payload": payload}, 604800)
+
+
 def radius_traffic_anomalies(hours):
     """Return every account matching an explicit window-scaled traffic rule."""
     gib = 1024 ** 3
@@ -4694,12 +4836,17 @@ def radius_traffic_anomalies(hours):
     rows = radius_ch_query(
         f"""
         SELECT username,
-               sum(input_delta) AS input_bytes,
-               sum(output_delta) AS output_bytes,
-               sum(input_delta + output_delta) AS total_bytes,
+               sumIf(input_delta, counter_rollback=0) AS input_bytes,
+               sumIf(output_delta, counter_rollback=0) AS output_bytes,
+               sumIf(input_delta + output_delta, counter_rollback=0) AS total_bytes,
                round(input_bytes / greatest(output_bytes, 1), 2) AS upload_ratio,
                uniqExact(acct_session_id) AS sessions,
+               countIf(counter_rollback=1) AS rollback_records,
+               toString(min(event_time)) AS first_seen,
                toString(max(event_time)) AS last_seen,
+               round(total_bytes * 8 /
+                     greatest(dateDiff('second',min(event_time),max(event_time)),1) /
+                     1000000, 2) AS average_mbps,
                toUInt8(total_bytes >= {heavy_threshold}) AS heavy_volume,
                toUInt8(input_bytes >= {upload_threshold}
                        AND upload_ratio >= {upload_ratio_threshold}) AS high_upload
@@ -4899,12 +5046,12 @@ def radius_profile():
                countIf(event_type='accounting' AND acct_status_type=1
                        AND event_time >= now()-INTERVAL 1 HOUR) AS starts_1h,
                countIf(event_type='accounting' AND counter_rollback=1) AS rollback_count,
-               sumIf(input_delta,event_type='accounting' AND event_time >= now()-INTERVAL 24 HOUR) AS input_24h,
-               sumIf(output_delta,event_type='accounting' AND event_time >= now()-INTERVAL 24 HOUR) AS output_24h,
-               sumIf(input_delta,event_type='accounting' AND event_time >= now()-INTERVAL 7 DAY) AS input_7d,
-               sumIf(output_delta,event_type='accounting' AND event_time >= now()-INTERVAL 7 DAY) AS output_7d,
-               sumIf(input_delta,event_type='accounting' AND event_time >= now()-INTERVAL 30 DAY) AS input_30d,
-               sumIf(output_delta,event_type='accounting' AND event_time >= now()-INTERVAL 30 DAY) AS output_30d,
+               sumIf(input_delta,event_type='accounting' AND counter_rollback=0 AND event_time >= now()-INTERVAL 24 HOUR) AS input_24h,
+               sumIf(output_delta,event_type='accounting' AND counter_rollback=0 AND event_time >= now()-INTERVAL 24 HOUR) AS output_24h,
+               sumIf(input_delta,event_type='accounting' AND counter_rollback=0 AND event_time >= now()-INTERVAL 7 DAY) AS input_7d,
+               sumIf(output_delta,event_type='accounting' AND counter_rollback=0 AND event_time >= now()-INTERVAL 7 DAY) AS output_7d,
+               sumIf(input_delta,event_type='accounting' AND counter_rollback=0 AND event_time >= now()-INTERVAL 30 DAY) AS input_30d,
+               sumIf(output_delta,event_type='accounting' AND counter_rollback=0 AND event_time >= now()-INTERVAL 30 DAY) AS output_30d,
                argMaxIf(result,event_time,event_type='auth') AS latest_auth_result,
                argMaxIf(reason_zh,event_time,event_type='auth') AS latest_auth_reason,
                if(
@@ -4926,7 +5073,8 @@ def radius_profile():
     flow = radius_ch_query(
         f"""
         SELECT toString(toStartOfHour(event_time)) AS bucket,
-               sum(input_delta) AS input_bytes,sum(output_delta) AS output_bytes
+               sumIf(input_delta,counter_rollback=0) AS input_bytes,
+               sumIf(output_delta,counter_rollback=0) AS output_bytes
         FROM radius_events
         WHERE event_type='accounting' AND event_time >= now()-INTERVAL 7 DAY
           AND {related_where}
@@ -4940,7 +5088,8 @@ def radius_profile():
                argMax(framed_ip,event_time) AS framed_ip,
                argMax(acct_status_type,event_time) AS latest_status,
                max(acct_session_time) AS session_seconds,
-               sum(input_delta) AS input_bytes,sum(output_delta) AS output_bytes,
+               sumIf(input_delta,counter_rollback=0) AS input_bytes,
+               sumIf(output_delta,counter_rollback=0) AS output_bytes,
                toString(min(event_time)) AS first_seen,toString(max(event_time)) AS last_seen
         FROM radius_events
         WHERE event_type='accounting' AND event_time >= now()-INTERVAL 30 DAY
@@ -4965,7 +5114,7 @@ def radius_profile():
                countIf(event_type='auth' AND result_code=2) AS accept_count,
                countIf(event_type='auth' AND result_code=3) AS reject_count,
                countIf(event_type='accounting') AS accounting_count,
-               sumIf(input_delta+output_delta,event_type='accounting') AS traffic_bytes,
+               sumIf(input_delta+output_delta,event_type='accounting' AND counter_rollback=0) AS traffic_bytes,
                toString(max(event_time)) AS last_seen
         FROM radius_events
         WHERE event_time >= now()-INTERVAL 30 DAY AND username!='' AND mac_addr!=''
@@ -5067,7 +5216,7 @@ def radius_overview():
                uniqExactIf(username, event_type='auth' AND username!='') AS auth_users,
                countIf(event_type='accounting') AS accounting_total,
                uniqExactIf(acct_session_id, event_type='accounting' AND acct_session_id!='') AS sessions,
-               sumIf(input_delta + output_delta, event_type='accounting') AS traffic_bytes,
+               sumIf(input_delta + output_delta, event_type='accounting' AND counter_rollback=0) AS traffic_bytes,
                countIf(event_type='control') AS control_total,
                countIf(event_type='accounting' AND acct_status_type IN (7,8)) AS nas_restart_events,
                toString(max(event_time)) AS latest_event_time
@@ -5080,7 +5229,7 @@ def radius_overview():
         SELECT toString(toStartOfInterval(event_time, INTERVAL 10 MINUTE)) AS bucket,
                countIf(event_type='auth' AND result_code=2) AS accepts,
                countIf(event_type='auth' AND result_code=3) AS rejects,
-               sumIf(input_delta + output_delta, event_type='accounting') AS traffic_bytes
+               sumIf(input_delta + output_delta, event_type='accounting' AND counter_rollback=0) AS traffic_bytes
         FROM radius_events WHERE {where}
         GROUP BY bucket ORDER BY bucket
         FORMAT JSON
@@ -5140,6 +5289,130 @@ def radius_analytics():
     if denied:
         return denied
     hours = radius_hours()
+    section = (request.args.get("section") or "auth").strip().lower()
+    if section not in ("auth", "session", "all"):
+        return fail(BAD_REQUEST, "section 必须为 auth、session 或 all")
+    cached_payload, snapshot_key = radius_page_snapshot(
+        "analytics", {"hours": hours, "section": section}, "analytics", radius_analytics
+    )
+    if cached_payload is not None:
+        return success(cached_payload)
+    if section == "auth":
+        auth_where = f"event_type='auth' AND event_time >= now() - INTERVAL {hours} HOUR"
+        reasons = radius_ch_query(
+            f"""SELECT if(reason_zh='', '未知', reason_zh) AS name,count() AS value
+                FROM radius_events WHERE {auth_where} AND result_code=3
+                GROUP BY name ORDER BY value DESC LIMIT 20 FORMAT JSON"""
+        )
+        nas = radius_ch_query(
+            f"""SELECT if(nas_ip='', '未知', nas_ip) AS nas_ip,count() AS total,
+                       countIf(result_code=2) AS accepts,countIf(result_code=3) AS rejects,
+                       round(rejects / greatest(total,1) * 100,2) AS reject_rate
+                FROM radius_events WHERE {auth_where}
+                GROUP BY nas_ip ORDER BY total DESC LIMIT 50 FORMAT JSON"""
+        )
+        control_events = radius_ch_query(
+            f"""SELECT toString(event_time) AS event_time,result,result_code,username,mac_addr,
+                       nas_ip,acct_session_id,error_cause,src_ip,dst_ip
+                FROM radius_events
+                WHERE event_type='control' AND event_time >= now() - INTERVAL {hours} HOUR
+                ORDER BY event_time DESC LIMIT 100 FORMAT JSON"""
+        )
+        payload = {"section": section, "reasons": reasons, "nas": nas,
+                   "control_events": control_events,
+                   "hours": hours}
+        store_radius_page_snapshot(snapshot_key, payload)
+        return success(payload)
+    if section == "session":
+        reconnects = radius_ch_query(
+            f"""SELECT username,countIf(acct_status_type=1) AS start_count,
+                       uniqExact(mac_addr) AS mac_count,uniqExact(nas_ip) AS nas_count,
+                       toString(max(event_time)) AS last_seen
+                FROM radius_events
+                WHERE event_type='accounting' AND username!=''
+                  AND event_time >= now() - INTERVAL {hours} HOUR
+                GROUP BY username HAVING start_count >= 3
+                ORDER BY start_count DESC,last_seen DESC LIMIT 100 FORMAT JSON"""
+        )
+        online_sessions = radius_ch_query(
+            f"""SELECT username,acct_session_id,nas_ip,mac_addr,framed_ip,
+                       toString(last_seen) AS last_seen,session_seconds,input_bytes,output_bytes
+                FROM
+                (
+                    SELECT username,acct_session_id,nas_ip,
+                           argMax(mac_addr,event_time) AS mac_addr,
+                           argMax(framed_ip,event_time) AS framed_ip,
+                           argMax(acct_status_type,event_time) AS latest_status,
+                           max(acct_session_time) AS session_seconds,
+                           sumIf(input_delta,counter_rollback=0) AS input_bytes,
+                           sumIf(output_delta,counter_rollback=0) AS output_bytes,
+                           max(event_time) AS last_seen
+                    FROM radius_events
+                    WHERE event_type='accounting' AND acct_session_id!=''
+                      AND event_time >= now() - INTERVAL {hours} HOUR
+                    GROUP BY username,acct_session_id,nas_ip
+                )
+                WHERE latest_status IN (1,3) AND last_seen >= now() - INTERVAL 60 MINUTE
+                ORDER BY last_seen DESC LIMIT 100 FORMAT JSON"""
+        )
+        terminate_causes = radius_ch_query(
+            f"""SELECT terminate_cause,
+                       concat(multiIf(
+                           terminate_cause=1,'用户主动下线',terminate_cause=2,'链路载波丢失',
+                           terminate_cause=3,'接入服务丢失',terminate_cause=4,'空闲超时',
+                           terminate_cause=5,'会话时长到期',terminate_cause=6,'管理员复位',
+                           terminate_cause=7,'管理员重启',terminate_cause=8,'端口错误',
+                           terminate_cause=9,'NAS 错误',terminate_cause=10,'NAS 主动结束',
+                           terminate_cause=11,'NAS 重启',terminate_cause=12,'端口不再需要',
+                           terminate_cause=13,'端口被抢占',terminate_cause=14,'端口挂起',
+                           terminate_cause=15,'服务不可用',terminate_cause=16,'回呼结束',
+                           terminate_cause=17,'用户侧错误',terminate_cause=18,'主机请求',
+                           terminate_cause=19,'终端重启',terminate_cause=20,'重新认证失败',
+                           terminate_cause=21,'端口重新初始化',terminate_cause=22,'端口禁用',
+                           terminate_cause=23,'设备掉电',terminate_cause=24,'策略触发',
+                           terminate_cause=25,'终端响应超时',terminate_cause=26,'MAC 未授权',
+                           '未知原因'), '（代码 ', toString(terminate_cause), '）') AS name,
+                       count() AS value
+                FROM radius_events
+                WHERE event_type='accounting' AND acct_status_type=2
+                  AND event_time >= now() - INTERVAL {hours} HOUR
+                GROUP BY terminate_cause,name ORDER BY value DESC LIMIT 20 FORMAT JSON"""
+        )
+        terminal_sharing = radius_ch_query(
+            f"""SELECT mac_addr,uniqExact(username) AS account_count,
+                       arrayStringConcat(arraySlice(groupUniqArray(20)(username),1,10),', ') AS accounts,
+                       uniqExact(nas_ip) AS nas_count,toString(max(event_time)) AS last_seen
+                FROM radius_events
+                WHERE event_time >= now() - INTERVAL {hours} HOUR
+                  AND username!='' AND username!='(未匹配)' AND mac_addr!=''
+                  AND ((event_type='auth' AND result_code=2) OR event_type='accounting')
+                GROUP BY mac_addr HAVING account_count>=2
+                ORDER BY account_count DESC,last_seen DESC LIMIT 100 FORMAT JSON"""
+        )
+        ip_conflicts = radius_ch_query(
+            """SELECT framed_ip,uniqExact(username) AS account_count,
+                       arrayStringConcat(arraySlice(groupUniqArray(20)(username),1,10),', ') AS accounts,
+                       uniqExact(mac_addr) AS mac_count,uniqExact(nas_ip) AS nas_count,
+                       toString(max(event_time)) AS last_seen
+                FROM radius_events
+                WHERE event_type='accounting' AND framed_ip!='' AND username!=''
+                  AND event_time >= now() - INTERVAL 15 MINUTE
+                GROUP BY framed_ip HAVING account_count>=2
+                ORDER BY last_seen DESC LIMIT 100 FORMAT JSON"""
+        )
+        session_summary = {
+            "active_sessions": len(online_sessions),
+            "reconnect_accounts": len(reconnects),
+            "stop_records": sum(int(row.get("value") or 0) for row in terminate_causes),
+            "top_terminate_cause": (terminate_causes[0].get("name") if terminate_causes else ""),
+            "activity_window_minutes": 60,
+        }
+        payload = {"section": section, "summary": session_summary, "reconnects": reconnects,
+                   "online_sessions": online_sessions, "terminate_causes": terminate_causes,
+                   "terminal_sharing": terminal_sharing, "ip_conflicts": ip_conflicts,
+                   "hours": hours}
+        store_radius_page_snapshot(snapshot_key, payload)
+        return success(payload)
     where = f"event_type='auth' AND event_time >= now() - INTERVAL {hours} HOUR"
     reasons = radius_ch_query(
         f"""SELECT if(reason_zh='', '未知', reason_zh) AS name,count() AS value
@@ -5174,7 +5447,8 @@ def radius_analytics():
                        argMax(framed_ip,event_time) AS framed_ip,
                        argMax(acct_status_type,event_time) AS latest_status,
                        max(acct_session_time) AS session_seconds,
-                       sum(input_delta) AS input_bytes,sum(output_delta) AS output_bytes,
+                       sumIf(input_delta,counter_rollback=0) AS input_bytes,
+                       sumIf(output_delta,counter_rollback=0) AS output_bytes,
                        max(event_time) AS last_seen
                 FROM radius_events
                 WHERE event_type='accounting' AND acct_session_id!=''
@@ -5245,14 +5519,16 @@ def radius_analytics():
             GROUP BY framed_ip HAVING account_count>=2
             ORDER BY last_seen DESC LIMIT 100 FORMAT JSON"""
     )
-    return success({
+    payload = {
         "reasons": reasons, "nas": nas, "reconnects": reconnects,
         "traffic_patterns": traffic_patterns, "traffic_rules": traffic_rules,
         "online_sessions": online_sessions,
         "terminate_causes": terminate_causes, "nas_restarts": nas_restarts,
         "control_events": control_events, "protocol_quality": protocol_quality,
         "terminal_sharing": terminal_sharing, "ip_conflicts": ip_conflicts, "hours": hours,
-    })
+    }
+    store_radius_page_snapshot(snapshot_key, payload)
+    return success(payload)
 
 
 @netops2026_bp.get("/radius/risk/reject")
@@ -5287,6 +5563,12 @@ def radius_multi_mac_risk():
         return denied
     hours = radius_hours()
     min_macs = int_arg("min_macs", 2, 2, 1000)
+    snapshot_params = {"hours": hours, "min_macs": min_macs}
+    cached_payload, snapshot_key = radius_page_snapshot(
+        "multi_mac", snapshot_params, "risk/multi-mac", radius_multi_mac_risk
+    )
+    if cached_payload is not None:
+        return success(cached_payload)
     limit_clause = ""
     if request.args.get("limit") is not None:
         limit_clause = f" LIMIT {int_arg('limit', 100, 1, 500)}"
@@ -5306,7 +5588,9 @@ def radius_multi_mac_risk():
         FORMAT JSON
         """
     )
-    return success({"items": rows, "hours": hours, "min_macs": min_macs})
+    payload = {"items": rows, "hours": hours, "min_macs": min_macs}
+    store_radius_page_snapshot(snapshot_key, payload)
+    return success(payload)
 
 
 @netops2026_bp.get("/radius/accounting")
@@ -5316,21 +5600,29 @@ def radius_accounting():
     if denied:
         return denied
     hours = radius_hours()
+    cached_payload, snapshot_key = radius_page_snapshot(
+        "accounting", {"hours": hours}, "accounting", radius_accounting
+    )
+    if cached_payload is not None:
+        return success(cached_payload)
     where = f"event_type='accounting' AND event_time >= now() - INTERVAL {hours} HOUR"
     summary = (radius_ch_query(
         f"""SELECT count() AS records,uniqExact(acct_session_id) AS sessions,
-                   uniqExact(username) AS users,sum(input_delta) AS input_bytes,
-                   sum(output_delta) AS output_bytes,toString(max(event_time)) AS latest_event_time
+                   uniqExact(username) AS users,
+                   sumIf(input_delta,counter_rollback=0) AS input_bytes,
+                   sumIf(output_delta,counter_rollback=0) AS output_bytes,
+                   toString(max(event_time)) AS latest_event_time
             FROM radius_events WHERE {where} FORMAT JSON"""
     ) or [{}])[0]
     traffic = radius_ch_query(
         f"""SELECT toString(toStartOfInterval(event_time, INTERVAL 10 MINUTE)) AS bucket,
-                   sum(input_delta) AS input_bytes,sum(output_delta) AS output_bytes
+                   sumIf(input_delta,counter_rollback=0) AS input_bytes,
+                   sumIf(output_delta,counter_rollback=0) AS output_bytes
             FROM radius_events WHERE {where}
             GROUP BY bucket ORDER BY bucket FORMAT JSON"""
     )
     quality = (radius_ch_query(
-        f"""SELECT countIf(input_delta+output_delta>0) AS delta_records,
+        f"""SELECT countIf(counter_rollback=0 AND input_delta+output_delta>0) AS delta_records,
                    countIf(counter_rollback=1) AS rollback_records,
                    countIf(acct_status_type=1) AS starts,
                    countIf(acct_status_type=2) AS stops,
@@ -5344,10 +5636,12 @@ def radius_accounting():
             FROM radius_events WHERE {where} FORMAT JSON"""
     ) or [{}])[0]
     anomalies, anomaly_rules = radius_traffic_anomalies(hours)
-    return success({"summary": summary, "traffic": traffic,
-                    "quality": quality,
-                    "coverage": coverage, "anomalies": anomalies,
-                    "anomaly_rules": anomaly_rules, "hours": hours})
+    payload = {"summary": summary, "traffic": traffic,
+               "quality": quality,
+               "coverage": coverage, "anomalies": anomalies,
+               "anomaly_rules": anomaly_rules, "hours": hours}
+    store_radius_page_snapshot(snapshot_key, payload)
+    return success(payload)
 
 
 @netops2026_bp.get("/radius/ingest/status")
