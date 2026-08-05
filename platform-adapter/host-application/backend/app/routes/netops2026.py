@@ -5,6 +5,7 @@ import base64
 import csv
 import hashlib
 import hmac
+import ipaddress
 import io
 import json
 import os
@@ -142,6 +143,52 @@ def normalized_audit_path(path):
     return re.sub(r"/\d+(?=/|$)", "/:id", clean)
 
 
+def audit_client_ip():
+    """Resolve the browser IP without trusting forwarding headers from arbitrary peers."""
+    peer = str(request.remote_addr or "").strip()
+    try:
+        peer_ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer[:64] or None
+
+    trusted_networks = []
+    configured = os.getenv("NETOPS2026_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")
+    for value in configured.split(","):
+        try:
+            trusted_networks.append(ipaddress.ip_network(value.strip(), strict=False))
+        except ValueError:
+            continue
+
+    def is_trusted(value):
+        return any(value in network for network in trusted_networks)
+
+    if not is_trusted(peer_ip):
+        return str(peer_ip)
+
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        forwarded_ips = []
+        try:
+            forwarded_ips = [
+                ipaddress.ip_address(value.strip())
+                for value in forwarded_for.split(",")
+                if value.strip()
+            ]
+        except ValueError:
+            forwarded_ips = []
+        for candidate in reversed(forwarded_ips):
+            if not is_trusted(candidate):
+                return str(candidate)
+
+    real_ip = str(request.headers.get("X-Real-IP") or "").strip()
+    if real_ip:
+        try:
+            return str(ipaddress.ip_address(real_ip))
+        except ValueError:
+            pass
+    return str(peer_ip)
+
+
 def audit_module_for_path(path):
     if path.startswith("/auth/"):
         return "auth"
@@ -238,7 +285,7 @@ def record_platform_usage(response):
             (
                 actor["user_id"], actor["username"], actor["display_name"], actor["role_code"], actor["org_name"],
                 audit_module_for_path(relative_path), audit_action_for_request(relative_path, request.method), request.method.upper(),
-                normalized_audit_path(relative_path), result, status_code, duration_ms, request.remote_addr,
+                normalized_audit_path(relative_path), result, status_code, duration_ms, audit_client_ip(),
                 (request.user_agent.string or "")[:255],
             ),
         )
@@ -1734,6 +1781,7 @@ def system_audit_route():
         return fail(BAD_REQUEST, "筛选参数格式不正确")
     module = (request.args.get("module") or "").strip()
     result = (request.args.get("result") or "").strip()
+    user_keyword = (request.args.get("user_keyword") or "").strip()[:64]
     keyword = (request.args.get("keyword") or "").strip()[:64]
     # The backfill marker is bookkeeping, not a user-facing platform action.
     # Keep it out of all dashboard metrics and audit rows.
@@ -1748,6 +1796,14 @@ def system_audit_route():
     if user_id is not None:
         clauses.append("user_id=%s")
         args.append(user_id)
+    if user_keyword:
+        user_clauses = ["username LIKE %s", "display_name LIKE %s"]
+        user_args = [f"%{user_keyword}%", f"%{user_keyword}%"]
+        if user_keyword.isdigit():
+            user_clauses.append("user_id=%s")
+            user_args.append(int(user_keyword))
+        clauses.append("(" + " OR ".join(user_clauses) + ")")
+        args.extend(user_args)
     if keyword:
         clauses.append("(username LIKE %s OR display_name LIKE %s OR action LIKE %s OR request_path LIKE %s)")
         args.extend([f"%{keyword}%"] * 4)
@@ -1831,7 +1887,10 @@ def system_audit_route():
         "page": page,
         "page_size": page_size,
         "hours": hours,
-        "filters": {"module": module or None, "result": result or None, "user_id": user_id, "keyword": keyword or None},
+        "filters": {
+            "module": module or None, "result": result or None, "user_id": user_id,
+            "user_keyword": user_keyword or None, "keyword": keyword or None,
+        },
     })
 
 
