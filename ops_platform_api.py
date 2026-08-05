@@ -62,12 +62,49 @@ def ensure_usage_audit_schema():
           duration_ms INT NULL,
           client_ip VARCHAR(64) NULL,
           user_agent VARCHAR(255) NULL,
+          event_kind VARCHAR(24) NOT NULL DEFAULT 'technical',
+          trigger_source VARCHAR(24) NULL,
+          search_content VARCHAR(512) NULL,
           KEY idx_usage_audit_time (occurred_at),
           KEY idx_usage_audit_user_time (user_id, occurred_at),
           KEY idx_usage_audit_module_time (module, occurred_at),
           KEY idx_usage_audit_action_time (action, occurred_at),
           KEY idx_usage_audit_result_time (result, occurred_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """
+    )
+    existing_columns = {
+        str(row.get("COLUMN_NAME") or "")
+        for row in query_all(
+            """
+            SELECT COLUMN_NAME
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='netops2026_usage_audit_log'
+            """
+        )
+    }
+    for column, ddl in {
+        "event_kind": "ADD COLUMN event_kind VARCHAR(24) NOT NULL DEFAULT 'technical' AFTER user_agent",
+        "trigger_source": "ADD COLUMN trigger_source VARCHAR(24) NULL AFTER event_kind",
+        "search_content": "ADD COLUMN search_content VARCHAR(512) NULL AFTER trigger_source",
+    }.items():
+        if column in existing_columns:
+            continue
+        try:
+            execute_write(f"ALTER TABLE netops2026_usage_audit_log {ddl}")
+        except pymysql.err.OperationalError as exc:
+            if not exc.args or int(exc.args[0]) != 1060:
+                raise
+    execute_write(
+        """
+        UPDATE netops2026_usage_audit_log
+        SET event_kind=CASE
+          WHEN action IN ('login','change_password') THEN 'security'
+          WHEN action='dashboard_visit' THEN 'page_view'
+          WHEN action IN ('run_ai_analysis','ai_chat','export_quality_excel','import_boss_users') THEN 'user_action'
+          ELSE event_kind
+        END
+        WHERE event_kind='technical'
         """
     )
     _USAGE_AUDIT_SCHEMA_READY = True
@@ -217,6 +254,37 @@ def audit_module_for_path(path):
     return "platform"
 
 
+def audit_module_for_page(path):
+    if path.startswith("/radius"):
+        return "radius"
+    if path.startswith("/aiops") or path == "/ai-assistant":
+        return "aiops"
+    if path.startswith(("/onu", "/quality")):
+        return "onu"
+    if path.startswith(("/performance", "/devices")):
+        return "olt"
+    if path.startswith(("/hfc", "/cmts")):
+        return "hfc"
+    if path.startswith("/boss"):
+        return "boss"
+    if path.startswith(("/users", "/user-orgs", "/device-orgs", "/permissions")):
+        return "access"
+    if path == "/system-audit":
+        return "system_audit"
+    if path == "/dashboard":
+        return "dashboard"
+    return "platform"
+
+
+def valid_audit_page_path(path):
+    exact = {
+        "/dashboard", "/onu-search", "/quality", "/performance", "/collector", "/devices",
+        "/boss-users", "/hfc", "/cmts-devices", "/settings", "/users", "/user-orgs",
+        "/device-orgs", "/permissions", "/system-audit", "/infrastructure", "/ai-assistant",
+    }
+    return path in exact or path == "/radius" or path.startswith("/radius/") or path == "/aiops" or path.startswith("/aiops/")
+
+
 def audit_action_for_request(path, method):
     method = str(method or "GET").upper()
     if path == "/auth/login":
@@ -234,6 +302,17 @@ def audit_action_for_request(path, method):
     if path == "/dashboard/presence":
         return "dashboard_visit"
     return method.lower() + ":" + normalized_audit_path(path).strip("/").replace("/", ".")
+
+
+def audit_search_content():
+    values = {}
+    for key in ("keyword", "user_keyword", "mac", "account", "username", "query", "search"):
+        value = str(request.args.get(key) or "").strip()
+        if value:
+            values[key] = value[:256]
+    if not values:
+        return None
+    return json.dumps(values, ensure_ascii=False, separators=(",", ":"))[:512]
 
 
 def audit_actor():
@@ -260,33 +339,59 @@ def start_usage_audit_timer():
 
 @netops2026_bp.after_request
 def record_platform_usage(response):
-    """Audit the outcome and route only; never persist passwords, tokens, query values, or bodies."""
+    """Record explicit behavior and security events; background GETs stay in access logs."""
     try:
         relative_path = request.path.replace(netops2026_bp.url_prefix, "", 1) or "/"
-        # Bootstrap probes happen on every page load and would distort feature usage.
-        if relative_path in ("/auth/me", "/navigation"):
+        if relative_path in ("/auth/me", "/navigation", "/usage/events"):
             return response
+        status_code = int(response.status_code)
+        search_content = audit_search_content()
+        event_kind = None
+        trigger_source = None
+        action = audit_action_for_request(relative_path, request.method)
         if relative_path == "/dashboard/presence":
             payload = request.get_json(silent=True) or {}
             if not payload.get("visit"):
                 return response
+            event_kind = "page_view"
+            trigger_source = "explicit"
+        elif relative_path in ("/auth/login", "/auth/change-password", "/boss/access"):
+            event_kind = "security"
+            trigger_source = "explicit"
+        elif status_code in (401, 403):
+            event_kind = "security"
+            trigger_source = "request"
+        elif status_code >= 400:
+            event_kind = "technical_error"
+            trigger_source = "request"
+        elif search_content:
+            event_kind = "user_action"
+            trigger_source = "explicit"
+            action = "search"
+        elif request.method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+            event_kind = "user_action"
+            trigger_source = "explicit"
+        elif relative_path.endswith("/export"):
+            event_kind = "user_action"
+            trigger_source = "explicit"
+        else:
+            return response
         started_at = getattr(g, "netops2026_audit_started_at", None)
         duration_ms = int((time.monotonic() - started_at) * 1000) if started_at else None
-        status_code = int(response.status_code)
         result = "success" if status_code < 400 else ("denied" if status_code in (401, 403) else "failed")
         actor = audit_actor()
         ensure_usage_audit_schema()
         execute_write(
             """
             INSERT INTO netops2026_usage_audit_log
-            (user_id,username,display_name,role_code,org_name,module,action,method,request_path,result,status_code,duration_ms,client_ip,user_agent)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            (user_id,username,display_name,role_code,org_name,module,action,method,request_path,result,status_code,duration_ms,client_ip,user_agent,event_kind,trigger_source,search_content)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 actor["user_id"], actor["username"], actor["display_name"], actor["role_code"], actor["org_name"],
-                audit_module_for_path(relative_path), audit_action_for_request(relative_path, request.method), request.method.upper(),
+                audit_module_for_path(relative_path), action, request.method.upper(),
                 normalized_audit_path(relative_path), result, status_code, duration_ms, audit_client_ip(),
-                (request.user_agent.string or "")[:255],
+                (request.user_agent.string or "")[:255], event_kind, trigger_source, search_content,
             ),
         )
     except Exception as exc:
@@ -654,7 +759,7 @@ def write_sensitive_audit(action, detail=None):
             action=action,
             target_type="boss_user_info",
             detail=json.dumps(detail or {}, ensure_ascii=False, separators=(",", ":")),
-            ip=request.remote_addr,
+            ip=audit_client_ip(),
         ))
         db.session.commit()
     except Exception:
@@ -1781,11 +1886,16 @@ def system_audit_route():
         return fail(BAD_REQUEST, "筛选参数格式不正确")
     module = (request.args.get("module") or "").strip()
     result = (request.args.get("result") or "").strip()
+    event_kind = (request.args.get("event_kind") or "").strip()
     user_keyword = (request.args.get("user_keyword") or "").strip()[:64]
     keyword = (request.args.get("keyword") or "").strip()[:64]
     # The backfill marker is bookkeeping, not a user-facing platform action.
     # Keep it out of all dashboard metrics and audit rows.
-    clauses = ["occurred_at >= DATE_SUB(NOW(), INTERVAL %s HOUR)", "request_path<>%s"]
+    clauses = [
+        "occurred_at >= DATE_SUB(NOW(), INTERVAL %s HOUR)",
+        "request_path<>%s",
+        "event_kind IN ('page_view','user_action','security')",
+    ]
     args = [hours, "/__system_audit_backfill__"]
     if module:
         clauses.append("module=%s")
@@ -1793,6 +1903,9 @@ def system_audit_route():
     if result:
         clauses.append("result=%s")
         args.append(result)
+    if event_kind in ("page_view", "user_action", "security"):
+        clauses.append("event_kind=%s")
+        args.append(event_kind)
     if user_id is not None:
         clauses.append("user_id=%s")
         args.append(user_id)
@@ -1805,8 +1918,8 @@ def system_audit_route():
         clauses.append("(" + " OR ".join(user_clauses) + ")")
         args.extend(user_args)
     if keyword:
-        clauses.append("(username LIKE %s OR display_name LIKE %s OR action LIKE %s OR request_path LIKE %s)")
-        args.extend([f"%{keyword}%"] * 4)
+        clauses.append("(username LIKE %s OR display_name LIKE %s OR action LIKE %s OR request_path LIKE %s OR search_content LIKE %s)")
+        args.extend([f"%{keyword}%"] * 5)
     where = " WHERE " + " AND ".join(clauses)
     overview = query_one(
         """
@@ -1871,7 +1984,8 @@ def system_audit_route():
                    ELSE '未认证访问'
                END AS display_name,
                role_code, org_name,
-               module, action, method, request_path, result, status_code, duration_ms, client_ip
+               module, action, method, request_path, result, status_code, duration_ms, client_ip,
+               event_kind, trigger_source, search_content
         FROM netops2026_usage_audit_log
         """ + where + " ORDER BY occurred_at DESC, id DESC LIMIT %s OFFSET %s",
         tuple(args + [page_size, (page - 1) * page_size]),
@@ -1888,10 +2002,37 @@ def system_audit_route():
         "page_size": page_size,
         "hours": hours,
         "filters": {
-            "module": module or None, "result": result or None, "user_id": user_id,
+            "module": module or None, "result": result or None, "event_kind": event_kind or None, "user_id": user_id,
             "user_keyword": user_keyword or None, "keyword": keyword or None,
         },
     })
+
+
+@netops2026_bp.post("/usage/events")
+@login_required
+def usage_event():
+    """Accept allow-listed, explicit UI behavior without accepting arbitrary audit payloads."""
+    payload = request.get_json(silent=True) or {}
+    event_type = str(payload.get("type") or "").strip()
+    page_path = str(payload.get("path") or "").strip()[:160]
+    page_label = str(payload.get("label") or "").strip()[:96]
+    if event_type != "page_view" or not valid_audit_page_path(page_path):
+        return fail(BAD_REQUEST, "行为事件格式不正确")
+    actor = audit_actor()
+    ensure_usage_audit_schema()
+    execute_write(
+        """
+        INSERT INTO netops2026_usage_audit_log
+        (user_id,username,display_name,role_code,org_name,module,action,method,request_path,result,status_code,duration_ms,client_ip,user_agent,event_kind,trigger_source,search_content)
+        VALUES (%s,%s,%s,%s,%s,%s,'page_view','EVENT',%s,'success',200,0,%s,%s,'page_view','explicit',%s)
+        """,
+        (
+            actor["user_id"], actor["username"], actor["display_name"], actor["role_code"], actor["org_name"],
+            audit_module_for_page(page_path), page_path, audit_client_ip(), (request.user_agent.string or "")[:255],
+            page_label or None,
+        ),
+    )
+    return success({"recorded": True})
 
 
 @netops2026_bp.get("/access/users")
@@ -3276,7 +3417,12 @@ def boss_users():
         item["address"] = mask_address(item.get("address"))
         item["phone1"] = mask_phone(item.get("phone1"))
         item["phone2"] = mask_phone(item.get("phone2"))
-    write_sensitive_audit("query", {"keyword_sha256": hashlib.sha256(keyword.encode("utf-8")).hexdigest(), "page": page, "result_count": len(items)})
+    write_sensitive_audit("query", {
+        "keyword": keyword[:256],
+        "keyword_sha256": hashlib.sha256(keyword.encode("utf-8")).hexdigest(),
+        "page": page,
+        "result_count": len(items),
+    })
     return no_store(success({"items": items, "total": int(total["total"]), "page": page, "size": size}))
 
 
